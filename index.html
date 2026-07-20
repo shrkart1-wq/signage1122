@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Плеер</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #status {
+    position: fixed; left: 12px; bottom: 12px; padding: 8px 14px;
+    background: rgba(0,0,0,.7); color: #9f9; font: 14px/1.5 monospace;
+    border-radius: 8px; white-space: pre; transition: opacity .5s; z-index: 10;
+  }
+  #status.error { color: #f99; }
+  #status.hidden { opacity: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+<video id="video" muted autoplay loop playsinline></video>
+<div id="status">запуск…</div>
+<script>
+// ============================================================
+// НАСТРОЙКА: вставьте сюда URL веб-приложения Apps Script
+// (Расширения → Apps Script → Развернуть → Веб-приложение)
+const MANIFEST_URL = 'https://script.google.com/macros/s/AKfycbxyuhY22167cXey26qTRNZOPiddIuTNR-4jpUeq_Ho4n6l5PEPGmJaAymlizSgjYHcA/exec';
+// ============================================================
+
+const q = new URLSearchParams(location.search);
+const manifestUrl = q.get('manifest') || MANIFEST_URL;
+const deviceId = q.get('device') || localStorage.getItem('deviceId') || 'test';
+localStorage.setItem('deviceId', deviceId);
+
+let pollMs = 120000;               // период опроса, сервер может переопределить
+let currentUrl = localStorage.getItem('videoUrl') || '';
+const video = document.getElementById('video');
+const statusEl = document.getElementById('status');
+let statusTimer = null;
+
+function showStatus(text, isError) {
+  statusEl.textContent = `[${deviceId}] ${text}`;
+  statusEl.classList.toggle('error', !!isError);
+  statusEl.classList.remove('hidden');
+  clearTimeout(statusTimer);
+  // ошибки висят постоянно, обычные сообщения прячутся через 10 сек
+  if (!isError) statusTimer = setTimeout(() => statusEl.classList.add('hidden'), 10000);
+}
+
+const cacheAvailable = 'caches' in window;
+
+async function fetchIntoCache(url) {
+  const cache = await caches.open('video-v1');
+  if (await cache.match(url)) return;
+  const resp = await fetch(url, { mode: 'cors' });
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  await cache.put(url, resp);
+  for (const key of await cache.keys()) {
+    if (key.url !== new Request(url).url) await cache.delete(key);
+  }
+}
+
+let objectUrl = null;
+async function playVideo(url) {
+  if (cacheAvailable) {
+    const cache = await caches.open('video-v1');
+    const resp = await cache.match(url);
+    if (resp) {
+      const blob = await resp.blob();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      objectUrl = URL.createObjectURL(blob);
+      video.src = objectUrl;
+      video.play().catch(() => {});
+      return;
+    }
+  }
+  video.src = url; // без кэша (нет https) — играем напрямую
+  video.play().catch(() => {});
+}
+
+async function switchTo(url) {
+  // пытаемся скачать в кэш целиком; если не вышло (нет CORS у хранилища,
+  // обрыв сети) — всё равно играем напрямую, просто без офлайн-запаса
+  if (cacheAvailable) {
+    try { await fetchIntoCache(url); }
+    catch (e) { console.warn('видео не закэшировано:', e.message); }
+  }
+  currentUrl = url;
+  localStorage.setItem('videoUrl', url);
+  await playVideo(url);
+  showStatus('ролик обновлён');
+}
+
+async function poll() {
+  if (!manifestUrl) {
+    showStatus('MANIFEST_URL не задан — впишите URL Apps Script в index.html', true);
+    return;
+  }
+  try {
+    const u = manifestUrl + (manifestUrl.includes('?') ? '&' : '?') +
+      'action=manifest&device=' + encodeURIComponent(deviceId) +
+      '&playing=' + encodeURIComponent(currentUrl) +
+      '&t=' + Date.now();
+    const resp = await fetch(u, { cache: 'no-store' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const m = await resp.json();
+    if (m.poll) pollMs = m.poll * 1000;
+    if (m.video && m.video !== currentUrl) await switchTo(m.video);
+    else if (!video.src && currentUrl) await playVideo(currentUrl);
+    if (!m.video && !currentUrl) showStatus('для устройства не назначен ролик', true);
+  } catch (e) {
+    // офлайн или сервер недоступен — продолжаем крутить что есть
+    if (currentUrl && !video.src) await playVideo(currentUrl);
+    if (!currentUrl) showStatus('нет связи и нет закэшированного ролика: ' + e.message, true);
+  } finally {
+    setTimeout(poll, pollMs);
+  }
+}
+
+if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+
+showStatus('устройство: ' + deviceId);
+if (currentUrl) playVideo(currentUrl); // после перезагрузки сразу играем из кэша
+poll();
+
+// страховка от «зависшего» видео: если стоим на месте дольше 30 сек — перезапуск
+let lastTime = -1, stuckCount = 0;
+setInterval(() => {
+  if (!video.src || video.paused) { video.play().catch(() => {}); return; }
+  if (video.currentTime === lastTime) {
+    if (++stuckCount >= 3 && currentUrl) { stuckCount = 0; playVideo(currentUrl); }
+  } else stuckCount = 0;
+  lastTime = video.currentTime;
+}, 10000);
+</script>
+</body>
+</html>
