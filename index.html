@@ -19,7 +19,7 @@
 </style>
 </head>
 <body>
-<video id="video" muted autoplay loop playsinline></video>
+<video id="video" muted autoplay playsinline></video>
 <div id="status">запуск…</div>
 <script>
 // ============================================================
@@ -33,8 +33,11 @@ const manifestUrl = q.get('manifest') || MANIFEST_URL;
 const deviceId = q.get('device') || localStorage.getItem('deviceId') || 'test';
 localStorage.setItem('deviceId', deviceId);
 
-let pollMs = 120000;               // период опроса, сервер может переопределить
-let currentUrl = localStorage.getItem('videoUrl') || '';
+let pollMs = 120000;                // период опроса, сервер может переопределить
+let playlist = [];                 // список ссылок на ролики
+let idx = 0;                       // какой ролик сейчас играет
+try { playlist = JSON.parse(localStorage.getItem('playlist') || '[]'); } catch (e) {}
+
 const video = document.getElementById('video');
 const statusEl = document.getElementById('status');
 let statusTimer = null;
@@ -50,19 +53,35 @@ function showStatus(text, isError) {
 
 const cacheAvailable = 'caches' in window;
 
-async function fetchIntoCache(url) {
+// скачиваем все ролики плейлиста в кэш и удаляем лишние (снятые с показа)
+async function syncCache(urls) {
+  if (!cacheAvailable) return;
   const cache = await caches.open('video-v1');
-  if (await cache.match(url)) return;
-  const resp = await fetch(url, { mode: 'cors' });
-  if (!resp.ok) throw new Error('HTTP ' + resp.status);
-  await cache.put(url, resp);
+  const wanted = new Set(urls.map((u) => new Request(u).url));
   for (const key of await cache.keys()) {
-    if (key.url !== new Request(url).url) await cache.delete(key);
+    if (!wanted.has(key.url)) await cache.delete(key);
+  }
+  for (const url of urls) {
+    if (await cache.match(url)) continue;
+    try {
+      const resp = await fetch(url, { mode: 'cors' });
+      if (resp.ok) await cache.put(url, resp);
+      else console.warn('не докачал', url, resp.status);
+    } catch (e) {
+      console.warn('видео не закэшировано:', url, e.message);
+    }
   }
 }
 
 let objectUrl = null;
-async function playVideo(url) {
+async function playAt(i) {
+  if (!playlist.length) return;
+  idx = ((i % playlist.length) + playlist.length) % playlist.length;
+  const url = playlist[idx];
+  // один ролик в списке — зацикливаем его средствами <video>, без стыков;
+  // несколько — переключаем вручную по событию "ended"
+  video.loop = playlist.length === 1;
+
   if (cacheAvailable) {
     const cache = await caches.open('video-v1');
     const resp = await cache.match(url);
@@ -75,21 +94,22 @@ async function playVideo(url) {
       return;
     }
   }
-  video.src = url; // без кэша (нет https) — играем напрямую
+  video.src = url; // ещё не закэшировано — играем напрямую
   video.play().catch(() => {});
 }
 
-async function switchTo(url) {
-  // пытаемся скачать в кэш целиком; если не вышло (нет CORS у хранилища,
-  // обрыв сети) — всё равно играем напрямую, просто без офлайн-запаса
-  if (cacheAvailable) {
-    try { await fetchIntoCache(url); }
-    catch (e) { console.warn('видео не закэшировано:', e.message); }
-  }
-  currentUrl = url;
-  localStorage.setItem('videoUrl', url);
-  await playVideo(url);
-  showStatus('ролик обновлён');
+// доиграл ролик — переходим к следующему по кругу
+video.addEventListener('ended', () => { if (playlist.length > 1) playAt(idx + 1); });
+
+async function applyPlaylist(urls) {
+  const changed = JSON.stringify(urls) !== JSON.stringify(playlist);
+  if (!changed) return;
+  playlist = urls;
+  localStorage.setItem('playlist', JSON.stringify(urls));
+  await syncCache(urls);         // сначала докачиваем, потом показываем
+  idx = 0;
+  await playAt(0);
+  showStatus('плейлист обновлён: ' + urls.length + ' ролик(ов)');
 }
 
 async function poll() {
@@ -100,19 +120,21 @@ async function poll() {
   try {
     const u = manifestUrl + (manifestUrl.includes('?') ? '&' : '?') +
       'action=manifest&device=' + encodeURIComponent(deviceId) +
-      '&playing=' + encodeURIComponent(currentUrl) +
+      '&playing=' + encodeURIComponent(playlist[idx] || '') +
       '&t=' + Date.now();
     const resp = await fetch(u, { cache: 'no-store' });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const m = await resp.json();
     if (m.poll) pollMs = m.poll * 1000;
-    if (m.video && m.video !== currentUrl) await switchTo(m.video);
-    else if (!video.src && currentUrl) await playVideo(currentUrl);
-    if (!m.video && !currentUrl) showStatus('для устройства не назначен ролик', true);
+    // сервер может вернуть список videos[] или одиночный video — принимаем оба
+    const urls = (m.videos && m.videos.length) ? m.videos : (m.video ? [m.video] : []);
+    if (urls.length) await applyPlaylist(urls);
+    else if (!playlist.length) showStatus('для устройства не назначен ролик', true);
+    if (playlist.length && !video.src) await playAt(idx);
   } catch (e) {
     // офлайн или сервер недоступен — продолжаем крутить что есть
-    if (currentUrl && !video.src) await playVideo(currentUrl);
-    if (!currentUrl) showStatus('нет связи и нет закэшированного ролика: ' + e.message, true);
+    if (playlist.length && !video.src) await playAt(idx);
+    if (!playlist.length) showStatus('нет связи и нет закэшированных роликов: ' + e.message, true);
   } finally {
     setTimeout(poll, pollMs);
   }
@@ -123,7 +145,7 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
 }
 
 showStatus('устройство: ' + deviceId);
-if (currentUrl) playVideo(currentUrl); // после перезагрузки сразу играем из кэша
+if (playlist.length) playAt(0); // после перезагрузки сразу играем из кэша
 poll();
 
 // страховка от «зависшего» видео: если стоим на месте дольше 30 сек — перезапуск
@@ -131,7 +153,7 @@ let lastTime = -1, stuckCount = 0;
 setInterval(() => {
   if (!video.src || video.paused) { video.play().catch(() => {}); return; }
   if (video.currentTime === lastTime) {
-    if (++stuckCount >= 3 && currentUrl) { stuckCount = 0; playVideo(currentUrl); }
+    if (++stuckCount >= 3 && playlist.length) { stuckCount = 0; playAt(idx); }
   } else stuckCount = 0;
   lastTime = video.currentTime;
 }, 10000);
